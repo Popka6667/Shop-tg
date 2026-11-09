@@ -1,0 +1,1396 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Telegram-бот для продажи аккаунтов по странам (aiogram 3.x).
+Оплата: CryptoBot (Crypto Pay API, боевая сеть).
+Аккаунт выдаётся ТОЛЬКО вручную админом после подтверждения оплаты.
+
+Установка:  pip install "aiogram>=3.4,<4" aiosqlite aiohttp
+Запуск:     python bot.py
+"""
+import asyncio
+import html
+import json
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+
+import aiohttp
+import aiosqlite
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import BaseFilter, Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+# ════════════════════════════════════════════════════════════
+#                        НАСТРОЙКИ
+#  Каждое значение можно переопределить переменной окружения.
+# ════════════════════════════════════════════════════════════
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9069579973:AAEcOXn7o6yqaozYyQmMh5bXbmeygDlOi8M")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "7966370337").replace(" ", "").split(",") if x}
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "svayzSlivach").lstrip("@")
+
+CRYPTOBOT_API_TOKEN = os.getenv("CRYPTOBOT_API_TOKEN", "672191:AAbYw9t7Lgt2eN2ua6sqTlZhJIELjWFuOZW")
+CRYPTOBOT_TESTNET = os.getenv("CRYPTOBOT_TESTNET", "false").lower() in ("1", "true", "yes")  # false = боевая сеть
+CRYPTOBOT_ACCEPTED_ASSETS = os.getenv("CRYPTOBOT_ACCEPTED_ASSETS", "USDT,TON,BTC,ETH")
+CRYPTOBOT_URL = "https://testnet-pay.crypt.bot/api" if CRYPTOBOT_TESTNET else "https://pay.crypt.bot/api"
+
+DB_PATH = os.getenv("DB_PATH", "shop.db")
+ISSUE_MINUTES = int(os.getenv("ISSUE_MINUTES", "30"))   # сколько минут обещаем на выдачу
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))   # как часто проверять неоплаченные счета (сек)
+INVOICE_TTL = 3600                                      # счёт CryptoBot живёт 1 час
+PENDING_EXPIRE_HOURS = 24                               # неоплаченные заказы закрываются через сутки
+
+log = logging.getLogger("bot")
+
+STATUS_LABELS = {
+    "pending": "⏳ ожидает оплаты",
+    "paid": "💰 оплачен",
+    "completed": "✅ выдан",
+    "rejected": "❌ отклонён",
+    "refunded": "↩️ возврат",
+}
+PAYLOG_LABELS = {"pending": "⏳ pending", "paid": "✅ paid", "failed": "❌ failed", "refunded": "↩️ refunded"}
+
+
+# ════════════════════════════════════════════════════════════
+#                        УТИЛИТЫ
+# ════════════════════════════════════════════════════════════
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def short_dt(s: str | None) -> str:
+    return (s or "—").replace("T", " ")[:16]
+
+
+def esc(value) -> str:
+    return html.escape(str(value if value is not None else ""))
+
+
+def fmt_price(value) -> str:
+    s = f"{float(value):,.2f}".replace(",", " ")
+    if s.endswith(".00"):
+        s = s[:-3]
+    return f"{s} ₽"
+
+
+def user_link(tg_id: int, username: str | None, full_name: str | None) -> str:
+    name = esc(full_name or username or tg_id)
+    link = f'<a href="tg://user?id={tg_id}">{name}</a>'
+    return link + (f" (@{esc(username)})" if username else "") + f" · <code>{tg_id}</code>"
+
+
+def country_text(c: dict) -> str:
+    stock = f"✅ В наличии: <b>{c['stock']}</b> шт." if c["stock"] > 0 else "❌ Нет в наличии"
+    return (f"{esc(c['flag_emoji'])} <b>{esc(c['name'])}</b>\n\n"
+            f"💵 Цена: <b>{fmt_price(c['price'])}</b>\n{stock}\n\n"
+            f"📝 {esc(c['description'] or 'Без описания')}")
+
+
+def order_admin_text(o: dict) -> str:
+    return (f"📦 <b>Заказ #{o['id']}</b>\n"
+            f"🌍 Страна: {esc(o['flag'])} {esc(o['country_name'])}\n"
+            f"💵 Сумма: {fmt_price(o['price'])}\n"
+            f"🪙 Оплата: CryptoBot\n"
+            f"👤 Покупатель: {user_link(o['tg_id'], o['username'], o['full_name'])}\n"
+            f"🕒 Создан: {short_dt(o['created_at'])}\n"
+            f"💰 Оплачен: {short_dt(o['paid_at'])}\n"
+            f"📌 Статус: {STATUS_LABELS.get(o['status'], o['status'])}")
+
+
+class IsAdmin(BaseFilter):
+    async def __call__(self, event: Message | CallbackQuery) -> bool:
+        return bool(event.from_user) and event.from_user.id in ADMIN_IDS
+
+
+async def safe_edit(call: CallbackQuery, text: str, reply_markup=None) -> None:
+    """Редактирует сообщение; если нельзя — отправляет новое."""
+    try:
+        await call.message.edit_text(text, reply_markup=reply_markup, disable_web_page_preview=True)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
+        await call.message.answer(text, reply_markup=reply_markup, disable_web_page_preview=True)
+
+
+# ════════════════════════════════════════════════════════════
+#                         БАЗА ДАННЫХ
+# ════════════════════════════════════════════════════════════
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id   INTEGER UNIQUE NOT NULL,
+    username      TEXT,
+    full_name     TEXT,
+    registered_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS countries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    flag_emoji  TEXT DEFAULT '',
+    price       REAL NOT NULL DEFAULT 0,
+    stock       INTEGER NOT NULL DEFAULT 0,
+    description TEXT DEFAULT '',
+    is_active   INTEGER NOT NULL DEFAULT 1
+);
+-- status: pending / paid / completed / rejected / refunded
+CREATE TABLE IF NOT EXISTS orders (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL,
+    country_id     INTEGER NOT NULL,
+    price          REAL NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    payment_method TEXT,
+    payment_id     TEXT,
+    payment_url    TEXT,
+    created_at     TEXT NOT NULL,
+    paid_at        TEXT,
+    completed_at   TEXT,
+    account_data   TEXT
+);
+-- status: pending / approved / rejected
+CREATE TABLE IF NOT EXISTS reviews (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    rating     INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notifications (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    country_id INTEGER NOT NULL,
+    UNIQUE(user_id, country_id)
+);
+-- status: pending / paid / failed / refunded
+CREATE TABLE IF NOT EXISTS payments_log (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id            INTEGER NOT NULL,
+    provider            TEXT NOT NULL,
+    provider_payment_id TEXT,
+    amount              REAL NOT NULL,
+    currency            TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    raw_response        TEXT,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_paylog_order ON payments_log(order_id);
+"""
+
+
+async def init_db() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(SCHEMA)
+        await db.commit()
+
+
+async def _fetchall(sql: str, params: tuple = ()) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(sql, params) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def _fetchone(sql: str, params: tuple = ()) -> dict | None:
+    rows = await _fetchall(sql, params)
+    return rows[0] if rows else None
+
+
+async def _execute(sql: str, params: tuple = ()) -> tuple[int, int]:
+    """Возвращает (lastrowid, rowcount)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(sql, params)
+        await db.commit()
+        return cur.lastrowid, cur.rowcount
+
+
+# ---------- users ----------
+async def upsert_user(telegram_id: int, username: str | None, full_name: str | None) -> dict:
+    await _execute(
+        """INSERT INTO users (telegram_id, username, full_name, registered_at) VALUES (?,?,?,?)
+           ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name""",
+        (telegram_id, username, full_name, now_iso()))
+    return await _fetchone("SELECT * FROM users WHERE telegram_id=?", (telegram_id,))
+
+
+async def all_user_tg_ids() -> list[int]:
+    return [r["telegram_id"] for r in await _fetchall("SELECT telegram_id FROM users")]
+
+
+# ---------- countries ----------
+async def get_countries(only_active: bool = True) -> list[dict]:
+    sql = "SELECT * FROM countries" + (" WHERE is_active=1" if only_active else "")
+    return await _fetchall(sql + " ORDER BY name")
+
+
+async def get_country(country_id: int) -> dict | None:
+    return await _fetchone("SELECT * FROM countries WHERE id=?", (country_id,))
+
+
+async def add_country(name: str, flag: str, price: float, stock: int, description: str) -> int:
+    cid, _ = await _execute(
+        "INSERT INTO countries (name, flag_emoji, price, stock, description) VALUES (?,?,?,?,?)",
+        (name, flag, price, stock, description))
+    return cid
+
+
+_COUNTRY_FIELDS = {"name", "flag_emoji", "price", "stock", "description", "is_active"}
+
+
+async def update_country_field(country_id: int, field: str, value) -> None:
+    if field not in _COUNTRY_FIELDS:  # защита от SQL-инъекции через имя поля
+        raise ValueError(f"Недопустимое поле: {field}")
+    await _execute(f"UPDATE countries SET {field}=? WHERE id=?", (value, country_id))
+
+
+async def delete_country(country_id: int) -> None:
+    await _execute("DELETE FROM countries WHERE id=?", (country_id,))
+    await _execute("DELETE FROM notifications WHERE country_id=?", (country_id,))
+
+
+async def decrement_stock(country_id: int) -> None:
+    await _execute("UPDATE countries SET stock = MAX(stock-1, 0) WHERE id=?", (country_id,))
+
+
+async def increment_stock(country_id: int) -> None:
+    await _execute("UPDATE countries SET stock = stock+1 WHERE id=?", (country_id,))
+
+
+# ---------- orders ----------
+_ORDER_SELECT = """
+SELECT o.*, COALESCE(c.name, 'Удалена') AS country_name, COALESCE(c.flag_emoji, '') AS flag,
+       u.telegram_id AS tg_id, u.username AS username, u.full_name AS full_name
+FROM orders o
+LEFT JOIN countries c ON c.id = o.country_id
+LEFT JOIN users u ON u.id = o.user_id
+"""
+
+
+async def create_order(user_id: int, country_id: int, price: float) -> int:
+    oid, _ = await _execute(
+        "INSERT INTO orders (user_id, country_id, price, status, payment_method, created_at) "
+        "VALUES (?,?,?,?,?,?)", (user_id, country_id, price, "pending", "cryptobot", now_iso()))
+    return oid
+
+
+async def set_order_payment(order_id: int, payment_id: str, url: str) -> None:
+    await _execute("UPDATE orders SET payment_id=?, payment_url=? WHERE id=?", (payment_id, url, order_id))
+
+
+async def get_order(order_id: int) -> dict | None:
+    return await _fetchone(_ORDER_SELECT + " WHERE o.id=?", (order_id,))
+
+
+async def get_user_orders(user_id: int, limit: int = 15) -> list[dict]:
+    return await _fetchall(_ORDER_SELECT + " WHERE o.user_id=? ORDER BY o.id DESC LIMIT ?", (user_id, limit))
+
+
+async def get_orders_by_status(status: str) -> list[dict]:
+    return await _fetchall(_ORDER_SELECT + " WHERE o.status=? ORDER BY o.id", (status,))
+
+
+async def get_pending_orders() -> list[dict]:
+    return await _fetchall("SELECT * FROM orders WHERE status='pending' AND payment_id IS NOT NULL")
+
+
+async def mark_order_paid(order_id: int) -> bool:
+    """Атомарно pending -> paid. True, если переход выполнен именно сейчас (идемпотентность)."""
+    _, n = await _execute("UPDATE orders SET status='paid', paid_at=? WHERE id=? AND status='pending'",
+                          (now_iso(), order_id))
+    return n == 1
+
+
+async def complete_order(order_id: int, account_data: str) -> bool:
+    _, n = await _execute(
+        "UPDATE orders SET status='completed', account_data=?, completed_at=? WHERE id=? AND status='paid'",
+        (account_data, now_iso(), order_id))
+    return n == 1
+
+
+async def set_order_status_if(order_id: int, from_statuses: tuple, new_status: str) -> bool:
+    marks = ",".join("?" * len(from_statuses))
+    _, n = await _execute(f"UPDATE orders SET status=? WHERE id=? AND status IN ({marks})",
+                          (new_status, order_id, *from_statuses))
+    return n == 1
+
+
+async def expire_old_pending(hours: int) -> None:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
+    await _execute("UPDATE orders SET status='rejected' WHERE status='pending' AND created_at < ?", (cutoff,))
+
+
+# ---------- payments_log ----------
+async def add_payment_log(order_id: int, provider_payment_id: str, amount: float,
+                          currency: str, status: str, raw: dict | None) -> None:
+    await _execute(
+        "INSERT INTO payments_log (order_id, provider, provider_payment_id, amount, currency, status, "
+        "raw_response, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (order_id, "cryptobot", provider_payment_id, amount, currency, status,
+         json.dumps(raw, ensure_ascii=False, default=str) if raw else None, now_iso()))
+
+
+async def update_payment_log(order_id: int, status: str, raw: dict | None = None) -> None:
+    await _execute("UPDATE payments_log SET status=?, raw_response=COALESCE(?, raw_response) WHERE order_id=?",
+                   (status, json.dumps(raw, ensure_ascii=False, default=str) if raw else None, order_id))
+
+
+async def get_payments(status: str | None = None, limit: int = 15) -> list[dict]:
+    if status:
+        return await _fetchall("SELECT * FROM payments_log WHERE status=? ORDER BY id DESC LIMIT ?",
+                               (status, limit))
+    return await _fetchall("SELECT * FROM payments_log ORDER BY id DESC LIMIT ?", (limit,))
+
+
+# ---------- stats ----------
+async def get_stats() -> dict:
+    users = (await _fetchone("SELECT COUNT(*) AS n FROM users"))["n"]
+    by_status = {r["status"]: r["n"] for r in
+                 await _fetchall("SELECT status, COUNT(*) AS n FROM orders GROUP BY status")}
+    revenue = (await _fetchone(
+        "SELECT COALESCE(SUM(price),0) AS s FROM orders WHERE status IN ('paid','completed')"))["s"]
+    return {"users": users, "by_status": by_status, "revenue": revenue}
+
+
+# ---------- reviews ----------
+async def add_review(user_id: int, rating: int, text: str) -> None:
+    await _execute("INSERT INTO reviews (user_id, rating, text, status, created_at) VALUES (?,?,?,?,?)",
+                   (user_id, rating, text, "pending", now_iso()))
+
+
+async def get_approved_reviews(limit: int = 10) -> list[dict]:
+    return await _fetchall(
+        "SELECT r.*, u.full_name FROM reviews r LEFT JOIN users u ON u.id=r.user_id "
+        "WHERE r.status='approved' ORDER BY r.id DESC LIMIT ?", (limit,))
+
+
+async def get_pending_reviews() -> list[dict]:
+    return await _fetchall(
+        "SELECT r.*, u.full_name, u.username FROM reviews r LEFT JOIN users u ON u.id=r.user_id "
+        "WHERE r.status='pending' ORDER BY r.id")
+
+
+async def set_review_status(review_id: int, status: str) -> None:
+    await _execute("UPDATE reviews SET status=? WHERE id=?", (status, review_id))
+
+
+# ---------- notifications ----------
+async def add_notification(user_id: int, country_id: int) -> None:
+    await _execute("INSERT OR IGNORE INTO notifications (user_id, country_id) VALUES (?,?)",
+                   (user_id, country_id))
+
+
+async def get_notifications_summary() -> list[dict]:
+    return await _fetchall(
+        "SELECT n.country_id AS id, COALESCE(c.flag_emoji,'') AS flag, COALESCE(c.name,'Удалена') AS name, "
+        "COUNT(*) AS cnt FROM notifications n LEFT JOIN countries c ON c.id=n.country_id "
+        "GROUP BY n.country_id ORDER BY cnt DESC")
+
+
+async def pop_notifications(country_id: int) -> list[int]:
+    """Возвращает telegram_id подписчиков и удаляет подписки."""
+    rows = await _fetchall(
+        "SELECT u.telegram_id FROM notifications n JOIN users u ON u.id=n.user_id WHERE n.country_id=?",
+        (country_id,))
+    await _execute("DELETE FROM notifications WHERE country_id=?", (country_id,))
+    return [r["telegram_id"] for r in rows]
+
+
+# ════════════════════════════════════════════════════════════
+#                  CRYPTOBOT (Crypto Pay API)
+# ════════════════════════════════════════════════════════════
+class CryptoBotError(Exception):
+    pass
+
+
+async def _crypto_call(method: str, http: str = "GET", params: dict | None = None, body: dict | None = None):
+    headers = {"Crypto-Pay-API-Token": CRYPTOBOT_API_TOKEN}
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(http, f"{CRYPTOBOT_URL}/{method}", headers=headers,
+                                   params=params, json=body) as resp:
+            data = await resp.json(content_type=None)
+    if not data.get("ok"):
+        raise CryptoBotError(str(data.get("error", data)))
+    return data["result"]
+
+
+async def crypto_create_invoice(order_id: int, amount_rub: float, description: str) -> dict:
+    """POST /createInvoice. Сумма в RUB — CryptoBot сам конвертирует в выбранную клиентом монету."""
+    body = {
+        "currency_type": "fiat",
+        "fiat": "RUB",
+        "accepted_assets": CRYPTOBOT_ACCEPTED_ASSETS,
+        "amount": f"{amount_rub:.2f}",
+        "description": description[:1024],
+        "payload": str(order_id),
+        "allow_comments": False,
+        "allow_anonymous": False,
+        "expires_in": INVOICE_TTL,
+    }
+    inv = await _crypto_call("createInvoice", "POST", body=body)
+    url = inv.get("bot_invoice_url") or inv.get("pay_url")
+    return {"payment_id": str(inv["invoice_id"]), "url": url, "raw": inv}
+
+
+async def crypto_check_status(invoice_id: str) -> dict:
+    """GET /getInvoices?invoice_ids=... -> нормализованный статус paid / pending / failed."""
+    result = await _crypto_call("getInvoices", "GET", params={"invoice_ids": str(invoice_id)})
+    items = result.get("items", []) if isinstance(result, dict) else result
+    if not items:
+        raise CryptoBotError(f"Счёт {invoice_id} не найден")
+    inv = items[0]
+    st = inv.get("status")
+    status = "paid" if st == "paid" else "failed" if st == "expired" else "pending"
+    amount = float(inv.get("paid_amount") or inv.get("amount") or 0)
+    currency = inv.get("paid_asset") or inv.get("fiat") or inv.get("asset") or "RUB"
+    return {"status": status, "amount": amount, "currency": currency, "raw": inv}
+
+
+# ════════════════════════════════════════════════════════════
+#                          КЛАВИАТУРЫ
+# ════════════════════════════════════════════════════════════
+def _btn(text: str, data: str | None = None, url: str | None = None) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data, url=url)
+
+
+def _kb(*rows: list) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
+
+
+# ----- пользователь -----
+def kb_main_menu():
+    return _kb([_btn("🛒 Купить аккаунт", "buy")],
+               [_btn("💰 Цены", "prices"), _btn("⭐ Отзывы", "reviews")],
+               [_btn("🆘 Поддержка", "support"), _btn("📋 Мои заказы", "orders")])
+
+
+def kb_back(to: str = "menu", text: str = "⬅️ Назад"):
+    return _kb([_btn(text, to)])
+
+
+def kb_countries(countries: list[dict]):
+    rows = [[_btn(f"{c['flag_emoji']} {c['name']} · {fmt_price(c['price'])}"
+                  + ("" if c["stock"] > 0 else " · нет"), f"country:{c['id']}")] for c in countries]
+    rows.append([_btn("⬅️ Назад", "menu")])
+    return _kb(*rows)
+
+
+def kb_country(c: dict):
+    first = (_btn("✅ Купить", f"buy:{c['id']}") if c["stock"] > 0
+             else _btn("🔔 Уведомить о поступлении", f"notify:{c['id']}"))
+    return _kb([first], [_btn("⬅️ Назад", "buy")])
+
+
+def kb_confirm_order():
+    return _kb([_btn("✅ Всё верно", "order_confirm")], [_btn("❌ Отмена", "menu")])
+
+
+def kb_payment_methods():
+    return _kb([_btn("🪙 Оплатить криптовалютой", "pay:cryptobot")], [_btn("❌ Отмена", "menu")])
+
+
+def kb_payment_link(url: str, order_id: int):
+    return _kb([_btn("🔗 Перейти к оплате", url=url)],
+               [_btn("✅ Я оплатил", f"check:{order_id}")],
+               [_btn("❌ Отменить заказ", f"cancel:{order_id}")])
+
+
+def kb_my_orders(orders: list[dict]):
+    rows = []
+    for o in orders:
+        if o["status"] == "pending" and o["payment_id"]:
+            rows.append([_btn(f"🔄 Проверить оплату #{o['id']}", f"check:{o['id']}")])
+        elif o["status"] == "completed":
+            rows.append([_btn(f"📄 Данные заказа #{o['id']}", f"show:{o['id']}")])
+    rows.append([_btn("⬅️ Назад", "menu")])
+    return _kb(*rows)
+
+
+def kb_reviews():
+    return _kb([_btn("✍️ Оставить отзыв", "review_new")], [_btn("⬅️ Назад", "menu")])
+
+
+def kb_rating():
+    return _kb([_btn("⭐" * n, f"rate:{n}") for n in (1, 2, 3)],
+               [_btn("⭐" * n, f"rate:{n}") for n in (4, 5)],
+               [_btn("❌ Отмена", "menu")])
+
+
+def kb_support():
+    rows = []
+    if SUPPORT_USERNAME:
+        rows.append([_btn("✉️ Написать в поддержку", url=f"https://t.me/{SUPPORT_USERNAME}")])
+    rows.append([_btn("⬅️ Назад", "menu")])
+    return _kb(*rows)
+
+
+def kb_stock_notify(country_id: int):
+    return _kb([_btn("🛒 Перейти к покупке", f"country:{country_id}")])
+
+
+# ----- админ -----
+def kb_admin_menu():
+    return _kb([_btn("📥 Заказы к выдаче", "admin:orders")],
+               [_btn("📊 Статистика", "admin:stats"), _btn("📦 Товар", "admin:products")],
+               [_btn("💳 Платежи", "admin:payments"), _btn("⭐ Отзывы", "admin:reviews")],
+               [_btn("📢 Рассылка", "admin:broadcast"), _btn("🔔 Уведомления", "admin:notifs")])
+
+
+def kb_admin_back():
+    return _kb([_btn("⬅️ В админ-панель", "admin")])
+
+
+def kb_issue(order_id: int):
+    return _kb([_btn("📤 Выдать аккаунт", f"issue:{order_id}")])
+
+
+def kb_admin_orders(orders: list[dict]):
+    rows = [[_btn(f"📤 #{o['id']} {o['flag']} {o['country_name']} · {fmt_price(o['price'])}",
+                  f"aorder:{o['id']}")] for o in orders[:30]]
+    rows.append([_btn("⬅️ В админ-панель", "admin")])
+    return _kb(*rows)
+
+
+def kb_admin_order(order_id: int):
+    return _kb([_btn("📤 Выдать аккаунт", f"issue:{order_id}")],
+               [_btn("↩️ Отклонить / возврат", f"refund:{order_id}")],
+               [_btn("⬅️ К списку", "admin:orders")])
+
+
+def kb_admin_products(countries: list[dict]):
+    rows = [[_btn(f"{'🟢' if c['is_active'] else '🔴'} {c['flag_emoji']} {c['name']} · "
+                  f"{fmt_price(c['price'])} · {c['stock']} шт.", f"pc:{c['id']}")] for c in countries]
+    rows.append([_btn("➕ Добавить страну", "pc_add")])
+    rows.append([_btn("⬅️ В админ-панель", "admin")])
+    return _kb(*rows)
+
+
+def kb_admin_country(c: dict):
+    cid = c["id"]
+    return _kb([_btn("🏳️ Название", f"pe:name:{cid}"), _btn("💰 Цена", f"pe:price:{cid}")],
+               [_btn("📦 Количество", f"pe:stock:{cid}"), _btn("📝 Описание", f"pe:description:{cid}")],
+               [_btn("🔴 Выключить" if c["is_active"] else "🟢 Включить", f"pt:{cid}")],
+               [_btn("🗑 Удалить", f"pd:{cid}")],
+               [_btn("⬅️ К списку", "admin:products")])
+
+
+def kb_admin_delete_confirm(cid: int):
+    return _kb([_btn("✅ Да, удалить", f"pdy:{cid}"), _btn("❌ Нет", f"pc:{cid}")])
+
+
+def kb_admin_payments():
+    return _kb([_btn("Все", "apay:all"), _btn("⏳", "apay:pending"), _btn("✅", "apay:paid")],
+               [_btn("❌", "apay:failed"), _btn("↩️", "apay:refunded")],
+               [_btn("⬅️ В админ-панель", "admin")])
+
+
+def kb_review_moderation(review_id: int):
+    return _kb([_btn("✅ Одобрить", f"rv_ok:{review_id}"), _btn("🚫 Отклонить", f"rv_no:{review_id}")],
+               [_btn("⬅️ В админ-панель", "admin")])
+
+
+def kb_broadcast_confirm():
+    return _kb([_btn("✅ Отправить всем", "bc_send")], [_btn("❌ Отмена", "admin")])
+
+
+# ════════════════════════════════════════════════════════════
+#                        FSM-СОСТОЯНИЯ
+# ════════════════════════════════════════════════════════════
+class OrderStates(StatesGroup):
+    confirming = State()
+    choosing_payment = State()
+
+
+class ReviewStates(StatesGroup):
+    rating = State()
+    text = State()
+
+
+class IssueStates(StatesGroup):
+    waiting_data = State()
+
+
+class ProductStates(StatesGroup):
+    add_name = State()
+    add_flag = State()
+    add_price = State()
+    add_stock = State()
+    add_desc = State()
+    edit_value = State()
+
+
+class BroadcastStates(StatesGroup):
+    waiting_message = State()
+    confirm = State()
+
+
+# ════════════════════════════════════════════════════════════
+#     ОБРАБОТКА ОПЛАТЫ (аккаунт здесь НЕ выдаётся — только 'paid')
+# ════════════════════════════════════════════════════════════
+async def process_paid(bot: Bot, order_id: int, amount: float, currency: str, raw: dict | None) -> bool:
+    """Идемпотентно переводит заказ в 'paid', уведомляет пользователя и админов."""
+    changed = await mark_order_paid(order_id)
+    await update_payment_log(order_id, "paid", raw)
+    if not changed:
+        return False  # уже обработан (поллер и кнопка «Я оплатил» сработали одновременно)
+
+    order = await get_order(order_id)
+    await decrement_stock(order["country_id"])
+
+    try:
+        await bot.send_message(
+            order["tg_id"],
+            f"✅ <b>Оплата получена!</b>\n\nАккаунт будет выдан администратором в течение "
+            f"<b>{ISSUE_MINUTES}</b> минут.\n📦 Номер заказа: <b>#{order_id}</b>")
+    except Exception:
+        log.exception("Не удалось уведомить пользователя о заказе #%s", order_id)
+
+    text = ("💰 <b>Новый оплаченный заказ!</b>\n\n" + order_admin_text(order)
+            + f"\n🧾 Получено: {amount:g} {esc(currency)}")
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb_issue(order_id))
+        except Exception:
+            log.exception("Не удалось уведомить админа %s", admin_id)
+    return True
+
+
+async def process_failed(bot: Bot, order_id: int, raw: dict | None) -> None:
+    ok = await set_order_status_if(order_id, ("pending",), "rejected")
+    await update_payment_log(order_id, "failed", raw)
+    if ok:
+        order = await get_order(order_id)
+        try:
+            await bot.send_message(
+                order["tg_id"],
+                f"❌ Счёт по заказу <b>#{order_id}</b> истёк или был отменён. Оформите заказ заново: /start")
+        except Exception:
+            pass
+
+
+async def notify_stock(bot: Bot, country_id: int) -> None:
+    """Уведомляет подписчиков, что страна снова в наличии."""
+    c = await get_country(country_id)
+    if not c or c["stock"] <= 0 or not c["is_active"]:
+        return
+    for tg_id in await pop_notifications(country_id):
+        try:
+            await bot.send_message(
+                tg_id, f"🔔 {esc(c['flag_emoji'])} <b>{esc(c['name'])}</b> снова в наличии! "
+                       f"Цена: {fmt_price(c['price'])}", reply_markup=kb_stock_notify(country_id))
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+
+async def payments_poller(bot: Bot) -> None:
+    """Фоновая проверка неоплаченных заказов через API CryptoBot."""
+    while True:
+        try:
+            await asyncio.sleep(POLL_INTERVAL)
+            for o in await get_pending_orders():
+                try:
+                    res = await crypto_check_status(o["payment_id"])
+                    if res["status"] == "paid":
+                        await process_paid(bot, o["id"], res["amount"], res["currency"], res["raw"])
+                    elif res["status"] == "failed":
+                        await process_failed(bot, o["id"], res["raw"])
+                except Exception:
+                    log.exception("Ошибка проверки заказа #%s", o["id"])
+            await expire_old_pending(PENDING_EXPIRE_HOURS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Ошибка в поллере платежей")
+
+
+# ════════════════════════════════════════════════════════════
+#                  РОУТЕРЫ: общие + пользователь
+# ════════════════════════════════════════════════════════════
+common = Router()   # /start, /cancel, меню — должен идти первым
+user = Router()
+admin = Router()
+admin.message.filter(IsAdmin())
+admin.callback_query.filter(IsAdmin())
+
+WELCOME = ("👋 <b>Добро пожаловать!</b>\n\nЗдесь можно купить Telegram-аккаунты разных стран. "
+           "Оплата криптовалютой, аккаунт выдаёт администратор после подтверждения оплаты.")
+
+
+@common.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    u = message.from_user
+    await upsert_user(u.id, u.username, u.full_name)
+    await message.answer(WELCOME, reply_markup=kb_main_menu())
+
+
+@common.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Действие отменено.", reply_markup=kb_main_menu())
+
+
+@common.callback_query(F.data == "menu")
+async def cb_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit(call, WELCOME, kb_main_menu())
+    await call.answer()
+
+
+# ---------- покупка ----------
+@user.callback_query(F.data == "buy")
+async def cb_buy(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    countries = await get_countries()
+    if not countries:
+        await safe_edit(call, "😔 Сейчас нет доступных стран.", kb_back())
+    else:
+        await safe_edit(call, "🌍 <b>Выберите страну:</b>", kb_countries(countries))
+    await call.answer()
+
+
+@user.callback_query(F.data == "prices")
+async def cb_prices(call: CallbackQuery):
+    countries = await get_countries()
+    if not countries:
+        text = "😔 Прайс пока пуст."
+    else:
+        lines = [f"{esc(c['flag_emoji'])} {esc(c['name'])} — <b>{fmt_price(c['price'])}</b> "
+                 f"({'в наличии: ' + str(c['stock']) if c['stock'] > 0 else 'нет в наличии'})"
+                 for c in countries]
+        text = "💰 <b>Цены</b>\n\n" + "\n".join(lines)
+    await safe_edit(call, text, kb_back())
+    await call.answer()
+
+
+@user.callback_query(F.data.startswith("country:"))
+async def cb_country(call: CallbackQuery):
+    c = await get_country(int(call.data.split(":")[1]))
+    if not c or not c["is_active"]:
+        await call.answer("Страна недоступна", show_alert=True)
+        return
+    await safe_edit(call, country_text(c), kb_country(c))
+    await call.answer()
+
+
+@user.callback_query(F.data.startswith("notify:"))
+async def cb_notify(call: CallbackQuery):
+    u = call.from_user
+    usr = await upsert_user(u.id, u.username, u.full_name)
+    await add_notification(usr["id"], int(call.data.split(":")[1]))
+    await call.answer("🔔 Готово! Мы сообщим, когда аккаунты поступят.", show_alert=True)
+
+
+# Шаг 1: подтверждение страны и цены
+@user.callback_query(F.data.startswith("buy:"))
+async def cb_buy_country(call: CallbackQuery, state: FSMContext):
+    c = await get_country(int(call.data.split(":")[1]))
+    if not c or not c["is_active"] or c["stock"] <= 0:
+        await call.answer("Нет в наличии", show_alert=True)
+        return
+    await state.set_state(OrderStates.confirming)
+    await state.update_data(country_id=c["id"])
+    await safe_edit(call, f"🧾 <b>Подтверждение заказа</b>\n\n🌍 Страна: {esc(c['flag_emoji'])} "
+                          f"<b>{esc(c['name'])}</b>\n💵 К оплате: <b>{fmt_price(c['price'])}</b>\n\nВсё верно?",
+                    kb_confirm_order())
+    await call.answer()
+
+
+# Шаг 2: выбор способа оплаты
+@user.callback_query(OrderStates.confirming, F.data == "order_confirm")
+async def cb_order_confirm(call: CallbackQuery, state: FSMContext):
+    await state.set_state(OrderStates.choosing_payment)
+    await safe_edit(call, "💳 <b>Выберите способ оплаты:</b>", kb_payment_methods())
+    await call.answer()
+
+
+# Шаг 3: создание счёта в CryptoBot
+@user.callback_query(OrderStates.choosing_payment, F.data == "pay:cryptobot")
+async def cb_pay(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    c = await get_country(data.get("country_id", 0))
+    if not c or not c["is_active"] or c["stock"] <= 0:
+        await state.clear()
+        await safe_edit(call, "😔 К сожалению, аккаунты закончились.", kb_back("buy"))
+        await call.answer()
+        return
+
+    u = call.from_user
+    usr = await upsert_user(u.id, u.username, u.full_name)
+    order_id = await create_order(usr["id"], c["id"], c["price"])
+    await call.answer("Создаю счёт…")
+
+    try:
+        inv = await crypto_create_invoice(order_id, c["price"],
+                                          f"Telegram-аккаунт: {c['name']} (заказ #{order_id})")
+    except Exception:
+        log.exception("Не удалось создать счёт для заказа #%s", order_id)
+        await set_order_status_if(order_id, ("pending",), "rejected")
+        await state.clear()
+        await safe_edit(call, "⚠️ Не удалось создать счёт. Попробуйте позже или напишите в поддержку.",
+                        kb_back())
+        return
+
+    await set_order_payment(order_id, inv["payment_id"], inv["url"])
+    await add_payment_log(order_id, inv["payment_id"], c["price"], "RUB", "pending", inv["raw"])
+    await state.clear()
+    await safe_edit(
+        call,
+        f"🧾 <b>Заказ #{order_id}</b>\n🌍 {esc(c['flag_emoji'])} {esc(c['name'])}\n"
+        f"💵 Сумма: <b>{fmt_price(c['price'])}</b>\n\nОплатите через @CryptoBot (USDT, TON, BTC, ETH), "
+        f"затем нажмите «✅ Я оплатил». Оплата также подтверждается автоматически.\n"
+        f"⏱ Счёт действует 1 час.",
+        kb_payment_link(inv["url"], order_id))
+
+
+# Шаг 4: проверка оплаты
+@user.callback_query(F.data.startswith("check:"))
+async def cb_check(call: CallbackQuery):
+    order = await get_order(int(call.data.split(":")[1]))
+    if not order or (order["tg_id"] != call.from_user.id and call.from_user.id not in ADMIN_IDS):
+        await call.answer("Заказ не найден", show_alert=True)
+        return
+    if order["status"] != "pending":
+        msg = ("✅ Оплата уже получена. Ожидайте выдачи аккаунта администратором."
+               if order["status"] == "paid" else f"Статус заказа: {STATUS_LABELS[order['status']]}")
+        await call.answer(msg, show_alert=True)
+        return
+    try:
+        res = await crypto_check_status(order["payment_id"])
+    except Exception:
+        log.exception("Ошибка проверки заказа #%s", order["id"])
+        await call.answer("⚠️ Не удалось проверить оплату, попробуйте через минуту.", show_alert=True)
+        return
+
+    if res["status"] == "paid":
+        await process_paid(call.bot, order["id"], res["amount"], res["currency"], res["raw"])
+        await call.answer("✅ Оплата подтверждена!")
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    elif res["status"] == "failed":
+        await process_failed(call.bot, order["id"], res["raw"])
+        await call.answer("❌ Счёт истёк или отменён.", show_alert=True)
+    else:
+        await call.answer("Оплата пока не найдена. Если вы уже оплатили — подождите минуту "
+                          "и нажмите снова.", show_alert=True)
+
+
+@user.callback_query(F.data.startswith("cancel:"))
+async def cb_cancel_order(call: CallbackQuery):
+    order = await get_order(int(call.data.split(":")[1]))
+    if not order or order["tg_id"] != call.from_user.id:
+        await call.answer("Заказ не найден", show_alert=True)
+        return
+    if await set_order_status_if(order["id"], ("pending",), "rejected"):
+        await update_payment_log(order["id"], "failed")
+        await safe_edit(call, f"❌ Заказ #{order['id']} отменён.", kb_back())
+    else:
+        await call.answer("Заказ уже нельзя отменить", show_alert=True)
+
+
+# ---------- мои заказы ----------
+@user.callback_query(F.data == "orders")
+async def cb_orders(call: CallbackQuery):
+    u = call.from_user
+    usr = await upsert_user(u.id, u.username, u.full_name)
+    orders = await get_user_orders(usr["id"])
+    if not orders:
+        await safe_edit(call, "📋 У вас пока нет заказов.", kb_back())
+        await call.answer()
+        return
+    lines = []
+    for o in orders:
+        line = (f"<b>#{o['id']}</b> · {esc(o['flag'])} {esc(o['country_name'])} · {fmt_price(o['price'])}\n"
+                f"   {STATUS_LABELS[o['status']]} · {short_dt(o['created_at'])}")
+        if o["status"] == "paid":
+            line += "\n   ⏳ Ожидает выдачи админом"
+        lines.append(line)
+    await safe_edit(call, "📋 <b>Мои заказы</b>\n\n" + "\n\n".join(lines), kb_my_orders(orders))
+    await call.answer()
+
+
+@user.callback_query(F.data.startswith("show:"))
+async def cb_show(call: CallbackQuery):
+    o = await get_order(int(call.data.split(":")[1]))
+    if not o or o["tg_id"] != call.from_user.id or o["status"] != "completed":
+        await call.answer("Недоступно", show_alert=True)
+        return
+    await call.message.answer(f"📝 Данные заказа #{o['id']}:\n<code>{esc(o['account_data'])}</code>")
+    await call.answer()
+
+
+# ---------- отзывы ----------
+@user.callback_query(F.data == "reviews")
+async def cb_reviews(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    reviews = await get_approved_reviews()
+    if reviews:
+        text = "⭐ <b>Отзывы покупателей</b>\n\n" + "\n\n".join(
+            f"{'⭐' * r['rating']} <b>{esc(r['full_name'] or 'Аноним')}</b>\n{esc(r['text'])}" for r in reviews)
+    else:
+        text = "⭐ Отзывов пока нет. Будьте первым!"
+    await safe_edit(call, text, kb_reviews())
+    await call.answer()
+
+
+@user.callback_query(F.data == "review_new")
+async def cb_review_new(call: CallbackQuery, state: FSMContext):
+    await state.set_state(ReviewStates.rating)
+    await safe_edit(call, "Оцените наш сервис:", kb_rating())
+    await call.answer()
+
+
+@user.callback_query(ReviewStates.rating, F.data.startswith("rate:"))
+async def cb_rate(call: CallbackQuery, state: FSMContext):
+    await state.update_data(rating=int(call.data.split(":")[1]))
+    await state.set_state(ReviewStates.text)
+    await safe_edit(call, "✍️ Напишите текст отзыва (до 500 символов):\n\n/cancel — отмена")
+    await call.answer()
+
+
+@user.message(ReviewStates.text, F.text)
+async def msg_review_text(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if len(text) > 500:
+        await message.answer("Слишком длинно, сократите до 500 символов.")
+        return
+    data = await state.get_data()
+    u = message.from_user
+    usr = await upsert_user(u.id, u.username, u.full_name)
+    await add_review(usr["id"], data["rating"], text)
+    await state.clear()
+    await message.answer("🙏 Спасибо! Отзыв появится после модерации.", reply_markup=kb_main_menu())
+
+
+# ---------- поддержка ----------
+@user.callback_query(F.data == "support")
+async def cb_support(call: CallbackQuery):
+    contact = f"@{SUPPORT_USERNAME}" if SUPPORT_USERNAME else "администратору"
+    await safe_edit(
+        call,
+        f"🆘 <b>Поддержка</b>\n\nВопросы по оплате и выдаче — пишите {contact}.\n"
+        f"Аккаунт выдаётся вручную в течение {ISSUE_MINUTES} минут после подтверждения оплаты. "
+        f"При обращении укажите номер заказа.", kb_support())
+    await call.answer()
+
+
+# ════════════════════════════════════════════════════════════
+#                       АДМИН-ПАНЕЛЬ
+# ════════════════════════════════════════════════════════════
+ADMIN_TITLE = "👨‍💼 <b>Админ-панель</b>"
+
+
+@admin.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(ADMIN_TITLE, reply_markup=kb_admin_menu())
+
+
+@admin.callback_query(F.data == "admin")
+async def cb_admin(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit(call, ADMIN_TITLE, kb_admin_menu())
+    await call.answer()
+
+
+@admin.callback_query(F.data == "admin:stats")
+async def cb_stats(call: CallbackQuery):
+    s = await get_stats()
+    lines = [f"{STATUS_LABELS[k]}: <b>{s['by_status'].get(k, 0)}</b>" for k in STATUS_LABELS]
+    total = sum(s["by_status"].values())
+    await safe_edit(call, f"📊 <b>Статистика</b>\n\n👥 Пользователей: <b>{s['users']}</b>\n"
+                          f"📦 Заказов всего: <b>{total}</b>\n" + "\n".join(lines) +
+                          f"\n\n💵 Выручка (оплачено + выдано): <b>{fmt_price(s['revenue'])}</b>",
+                    kb_admin_back())
+    await call.answer()
+
+
+@admin.callback_query(F.data == "admin:notifs")
+async def cb_notifs(call: CallbackQuery):
+    rows = await get_notifications_summary()
+    text = "🔔 <b>Ожидают уведомления о поступлении</b>\n\n" + (
+        "\n".join(f"{esc(r['flag'])} {esc(r['name'])} — <b>{r['cnt']}</b> чел." for r in rows)
+        if rows else "Подписок нет.")
+    await safe_edit(call, text, kb_admin_back())
+    await call.answer()
+
+
+# ---------- заказы к выдаче ----------
+@admin.callback_query(F.data == "admin:orders")
+async def cb_admin_orders(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    orders = await get_orders_by_status("paid")
+    if not orders:
+        await safe_edit(call, "📥 Нет заказов, ожидающих выдачи.", kb_admin_back())
+    else:
+        await safe_edit(call, f"📥 <b>Ожидают выдачи: {len(orders)}</b>", kb_admin_orders(orders))
+    await call.answer()
+
+
+@admin.callback_query(F.data.startswith("aorder:"))
+async def cb_admin_order(call: CallbackQuery):
+    o = await get_order(int(call.data.split(":")[1]))
+    if not o:
+        await call.answer("Заказ не найден", show_alert=True)
+        return
+    await safe_edit(call, order_admin_text(o), kb_admin_order(o["id"]))
+    await call.answer()
+
+
+@admin.callback_query(F.data.startswith("issue:"))
+async def cb_issue(call: CallbackQuery, state: FSMContext):
+    order_id = int(call.data.split(":")[1])
+    o = await get_order(order_id)
+    if not o or o["status"] != "paid":
+        await call.answer("Заказ уже обработан или не оплачен", show_alert=True)
+        return
+    await state.set_state(IssueStates.waiting_data)
+    await state.update_data(order_id=order_id)
+    await call.message.answer(
+        f"✍️ Введите данные аккаунта для заказа <b>#{order_id}</b> "
+        f"({esc(o['flag'])} {esc(o['country_name'])}):\n\n"
+        f"<code>login:password</code> или session-строка.\n/cancel — отмена")
+    await call.answer()
+
+
+@admin.message(IssueStates.waiting_data, F.text)
+async def msg_issue_data(message: Message, state: FSMContext):
+    account_data = message.text.strip()
+    if not account_data:
+        await message.answer("Данные не должны быть пустыми.")
+        return
+    order_id = (await state.get_data())["order_id"]
+    await state.clear()
+
+    if not await complete_order(order_id, account_data):
+        await message.answer("⚠️ Заказ уже обработан другим админом или не в статусе «оплачен».")
+        return
+    o = await get_order(order_id)
+    try:
+        await message.bot.send_message(
+            o["tg_id"],
+            f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n"
+            f"🌍 Страна: {esc(o['flag'])} {esc(o['country_name'])}\n"
+            f"📝 Данные аккаунта:\n<code>{esc(account_data)}</code>\n\nСпасибо за покупку!")
+        await message.answer(f"✅ Заказ #{order_id} выдан, пользователь уведомлён.")
+    except TelegramForbiddenError:
+        await message.answer(f"⚠️ Заказ #{order_id} сохранён как выданный, но пользователь заблокировал "
+                             f"бота. Передайте данные вручную.")
+    except Exception:
+        log.exception("Ошибка отправки данных по заказу #%s", order_id)
+        await message.answer(f"⚠️ Заказ #{order_id} сохранён, но отправить сообщение не удалось. "
+                             f"Пользователь может открыть данные в «Мои заказы».")
+
+
+@admin.callback_query(F.data.startswith("refund:"))
+async def cb_refund(call: CallbackQuery):
+    order_id = int(call.data.split(":")[1])
+    if not await set_order_status_if(order_id, ("paid",), "refunded"):
+        await call.answer("Заказ уже обработан", show_alert=True)
+        return
+    o = await get_order(order_id)
+    await update_payment_log(order_id, "refunded")
+    await increment_stock(o["country_id"])  # единица товара возвращается на склад
+    try:
+        await call.bot.send_message(
+            o["tg_id"], f"↩️ Заказ <b>#{order_id}</b> отклонён. Средства будут возвращены — "
+                        f"свяжитесь с поддержкой.")
+    except Exception:
+        pass
+    await safe_edit(call, f"↩️ Заказ #{order_id} отклонён.\n⚠️ Сам возврат денег выполните вручную "
+                          f"в @CryptoBot.", kb_admin_back())
+    await call.answer()
+
+
+# ---------- платежи ----------
+async def _show_payments(call: CallbackQuery, status: str | None):
+    rows = await get_payments(status)
+    if not rows:
+        text = "💳 <b>Платежи</b>\n\nПусто."
+    else:
+        text = "💳 <b>Платежи</b> (последние 15)\n\n" + "\n".join(
+            f"#{r['id']} · заказ <b>#{r['order_id']}</b> · 🪙 CryptoBot · "
+            f"{r['amount']:g} {esc(r['currency'])} · {PAYLOG_LABELS.get(r['status'], r['status'])} · "
+            f"{short_dt(r['created_at'])}" for r in rows)
+    await safe_edit(call, text, kb_admin_payments())
+    await call.answer()
+
+
+@admin.callback_query(F.data == "admin:payments")
+async def cb_payments(call: CallbackQuery):
+    await _show_payments(call, None)
+
+
+@admin.callback_query(F.data.startswith("apay:"))
+async def cb_payments_filter(call: CallbackQuery):
+    status = call.data.split(":")[1]
+    await _show_payments(call, None if status == "all" else status)
+
+
+# ---------- модерация отзывов ----------
+async def _show_next_review(call: CallbackQuery):
+    pending = await get_pending_reviews()
+    if not pending:
+        await safe_edit(call, "⭐ Нет отзывов на модерации.", kb_admin_back())
+        return
+    r = pending[0]
+    who = esc(r["full_name"] or "—") + (f" (@{esc(r['username'])})" if r["username"] else "")
+    await safe_edit(call, f"⭐ <b>Отзыв на модерации</b> (осталось: {len(pending)})\n\n"
+                          f"👤 {who}\n{'⭐' * r['rating']}\n\n{esc(r['text'])}",
+                    kb_review_moderation(r["id"]))
+
+
+@admin.callback_query(F.data == "admin:reviews")
+async def cb_admin_reviews(call: CallbackQuery):
+    await _show_next_review(call)
+    await call.answer()
+
+
+@admin.callback_query(F.data.startswith("rv_ok:") | F.data.startswith("rv_no:"))
+async def cb_moderate(call: CallbackQuery):
+    action, rid = call.data.split(":")
+    await set_review_status(int(rid), "approved" if action == "rv_ok" else "rejected")
+    await _show_next_review(call)
+    await call.answer("Готово")
+
+
+# ---------- управление товаром ----------
+FIELD_PROMPTS = {
+    "name": "Введите новое название:",
+    "price": "Введите новую цену в рублях (число):",
+    "stock": "Введите количество в наличии (целое число):",
+    "description": "Введите новое описание:",
+}
+
+
+async def _show_admin_country(call: CallbackQuery, cid: int):
+    c = await get_country(cid)
+    if not c:
+        await call.answer("Не найдено", show_alert=True)
+        return
+    await safe_edit(call, country_text(c) + f"\n\n🔘 Активна: {'да' if c['is_active'] else 'нет'}",
+                    kb_admin_country(c))
+
+
+@admin.callback_query(F.data == "admin:products")
+async def cb_products(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    countries = await get_countries(only_active=False)
+    await safe_edit(call, "📦 <b>Управление товаром</b>", kb_admin_products(countries))
+    await call.answer()
+
+
+@admin.callback_query(F.data.startswith("pc:"))
+async def cb_pc(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _show_admin_country(call, int(call.data.split(":")[1]))
+    await call.answer()
+
+
+@admin.callback_query(F.data.startswith("pt:"))
+async def cb_toggle(call: CallbackQuery):
+    cid = int(call.data.split(":")[1])
+    c = await get_country(cid)
+    if c:
+        await update_country_field(cid, "is_active", 0 if c["is_active"] else 1)
+        await notify_stock(call.bot, cid)
+    await _show_admin_country(call, cid)
+    await call.answer("Готово")
+
+
+@admin.callback_query(F.data.startswith("pd:"))
+async def cb_delete(call: CallbackQuery):
+    cid = int(call.data.split(":")[1])
+    await safe_edit(call, "🗑 Удалить страну? Старые заказы сохранятся.", kb_admin_delete_confirm(cid))
+    await call.answer()
+
+
+@admin.callback_query(F.data.startswith("pdy:"))
+async def cb_delete_yes(call: CallbackQuery):
+    await delete_country(int(call.data.split(":")[1]))
+    countries = await get_countries(only_active=False)
+    await safe_edit(call, "✅ Удалено.\n\n📦 <b>Управление товаром</b>", kb_admin_products(countries))
+    await call.answer()
+
+
+@admin.callback_query(F.data.startswith("pe:"))
+async def cb_edit(call: CallbackQuery, state: FSMContext):
+    _, field, cid = call.data.split(":")
+    await state.set_state(ProductStates.edit_value)
+    await state.update_data(field=field, cid=int(cid))
+    await call.message.answer(FIELD_PROMPTS[field] + "\n/cancel — отмена")
+    await call.answer()
+
+
+@admin.message(ProductStates.edit_value, F.text)
+async def msg_edit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    field, cid = data["field"], data["cid"]
+    raw = message.text.strip()
+    try:
+        if field == "price":
+            value = float(raw.replace(",", "."))
+            if value <= 0:
+                raise ValueError
+        elif field == "stock":
+            value = int(raw)
+            if value < 0:
+                raise ValueError
+        else:
+            value = raw
+            if not value:
+                raise ValueError
+    except ValueError:
+        await message.answer("❌ Некорректное значение, попробуйте ещё раз.")
+        return
+    # в БД название флага хранится в flag_emoji, остальные поля совпадают по имени
+    await update_country_field(cid, field, value)
+    await state.clear()
+    if field == "stock":
+        await notify_stock(message.bot, cid)
+    c = await get_country(cid)
+    await message.answer("✅ Сохранено.\n\n" + country_text(c), reply_markup=kb_admin_country(c))
+
+
+@admin.callback_query(F.data == "pc_add")
+async def cb_add(call: CallbackQuery, state: FSMContext):
+    await state.set_state(ProductStates.add_name)
+    await call.message.answer("➕ Название страны (например, «США»):\n/cancel — отмена")
+    await call.answer()
+
+
+@admin.message(ProductStates.add_name, F.text)
+async def add_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await state.set_state(ProductStates.add_flag)
+    await message.answer("Эмодзи флага (например, 🇺🇸):")
+
+
+@admin.message(ProductStates.add_flag, F.text)
+async def add_flag(message: Message, state: FSMContext):
+    await state.update_data(flag=message.text.strip())
+    await state.set_state(ProductStates.add_price)
+    await message.answer("Цена в рублях:")
+
+
+@admin.message(ProductStates.add_price, F.text)
+async def add_price(message: Message, state: FSMContext):
+    try:
+        price = float(message.text.replace(",", "."))
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число больше нуля.")
+        return
+    await state.update_data(price=price)
+    await state.set_state(ProductStates.add_stock)
+    await message.answer("Количество в наличии:")
+
+
+@admin.message(ProductStates.add_stock, F.text)
+async def add_stock(message: Message, state: FSMContext):
+    try:
+        stock = int(message.text)
+        if stock < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число ≥ 0.")
+        return
+    await state.update_data(stock=stock)
+    await state.set_state(ProductStates.add_desc)
+    await message.answer("Описание (или «-», чтобы пропустить):")
+
+
+@admin.message(ProductStates.add_desc, F.text)
+async def add_desc(message: Message, state: FSMContext):
+    d = await state.get_data()
+    desc = "" if message.text.strip() == "-" else message.text.strip()
+    cid = await add_country(d["name"], d["flag"], d["price"], d["stock"], desc)
+    await state.clear()
+    c = await get_country(cid)
+    await message.answer("✅ Страна добавлена.\n\n" + country_text(c), reply_markup=kb_admin_country(c))
+
+
+# ---------- рассылка ----------
+@admin.callback_query(F.data == "admin:broadcast")
+async def cb_broadcast(call: CallbackQuery, state: FSMContext):
+    await state.set_state(BroadcastStates.waiting_message)
+    await call.message.answer("📢 Пришлите сообщение для рассылки (текст, фото и т.д.).\n/cancel — отмена")
+    await call.answer()
+
+
+@admin.message(BroadcastStates.waiting_message)
+async def msg_broadcast(message: Message, state: FSMContext):
+    await state.update_data(chat_id=message.chat.id, message_id=message.message_id)
+    await state.set_state(BroadcastStates.confirm)
+    await message.answer("👆 Так будет выглядеть сообщение. Отправить всем пользователям?",
+                         reply_markup=kb_broadcast_confirm())
+
+
+@admin.callback_query(BroadcastStates.confirm, F.data == "bc_send")
+async def cb_bc_send(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    await call.message.edit_reply_markup(reply_markup=None)
+    ok = fail = 0
+    for tg_id in await all_user_tg_ids():
+        try:
+            await call.bot.copy_message(tg_id, data["chat_id"], data["message_id"])
+            ok += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await call.bot.copy_message(tg_id, data["chat_id"], data["message_id"])
+                ok += 1
+            except Exception:
+                fail += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)  # лимит Telegram ~30 сообщений/сек
+    await call.message.answer(f"📢 Рассылка завершена.\n✅ Доставлено: {ok}\n❌ Не доставлено: {fail}",
+                              reply_markup=kb_admin_back())
+    await call.answer()
+
+
+# ════════════════════════════════════════════════════════════
+#                         ТОЧКА ВХОДА
+# ════════════════════════════════════════════════════════════
+async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()],
+    )
+    await init_db()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    # Порядок важен: common (/start, /cancel) и админ-роутер идут раньше пользовательского
+    dp.include_routers(common, admin, user)
+
+    poller = asyncio.create_task(payments_poller(bot))
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        log.info("Бот запущен (CryptoBot: %s)", "TESTNET" if CRYPTOBOT_TESTNET else "боевая сеть")
+        await dp.start_polling(bot)
+    finally:
+        poller.cancel()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
